@@ -12,7 +12,7 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-
+#include "sync.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 
@@ -87,12 +87,19 @@ static void save_fixture_id_to_nvs(const char *fixture_id)
 static void build_device_id(void)
 {
     uint8_t mac[6];
-    // Haal de WiFi STA MAC-adres op
+
+#if CONFIG_SYNC_ROLE_MASTER
+    // Master heeft altijd vaste ID
+    snprintf(g_device_id, sizeof(g_device_id), "esp-master");
+    ESP_LOGI(TAG, "Device ID (MASTER): %s", g_device_id);
+#else
+    // Slaves gebruiken MAC
     ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_STA));
     snprintf(g_device_id, sizeof(g_device_id),
              "esp-%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "Device ID: %s", g_device_id);
+    ESP_LOGI(TAG, "Device ID (SLAVE): %s", g_device_id);
+#endif
 }
 
 /* ==== WIFI ==== */
@@ -236,11 +243,7 @@ static void handle_command(const char *topic, const char *payload, int len)
 
     ESP_LOGI(TAG, "Cmd=%s Payload=\"%s\"", cmd, buf);
 
-    if (strcmp(cmd, "ping") == 0)
-    {
-        mqtt_publish_status("pong");
-    }
-    else if (strcmp(cmd, "run_selftest") == 0)
+    if (strcmp(cmd, "run_selftest") == 0)
     {
         mqtt_publish_status("running_selftest");
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -277,6 +280,20 @@ static void handle_command(const char *topic, const char *payload, int len)
         mqtt_publish_result(json);
         ESP_LOGI(TAG, "Reported time: %ld", (long)now);
     }
+    else if (strcmp(cmd, "get_sync_time") == 0)
+    {
+        int64_t t_us = sync_get_time_us();
+        bool synced = sync_is_synced();
+
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"time_us\":%" PRId64 ",\"synced\":%s}",
+                 t_us,
+                 synced ? "true" : "false");
+
+        mqtt_publish_result(json);
+    }
+
     else
     {
         ESP_LOGW(TAG, "Unknown command: %s", cmd);
@@ -357,7 +374,9 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             snprintf(cmd_topic, sizeof(cmd_topic),
                      "fixture/%s/cmd/#", g_fixture_id);
             esp_mqtt_client_subscribe(event->client, cmd_topic, 1);
+            esp_mqtt_client_subscribe(event->client, "fixture/discovery", 1);
             ESP_LOGI(TAG, "Subscribed to %s", cmd_topic);
+            ESP_LOGI(TAG, "Subscribed to fixture/discovery");
 
             mqtt_publish_status("online");
         }
@@ -387,7 +406,21 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                        : (int)sizeof(topic) - 1;
         memcpy(topic, event->topic, tlen);
         topic[tlen] = '\0';
-
+        if (strcmp(topic, "fixture/discovery") == 0)
+        {
+            if (g_fixture_id[0] != '\0')
+            {
+                mqtt_publish_status("online");
+                ESP_LOGI(TAG, "Responded to discovery request");
+                break;
+            }
+            else
+            {
+                // Niet geprovisioneerd, negeer
+                ESP_LOGI(TAG, "Ignoring discovery request, no fixture_id set");
+                break;
+            }
+        }
         ESP_LOGI(TAG, "MQTT DATA topic=%s len=%d", topic, event->data_len);
 
         // Eerst checken of dit een config-bericht is
@@ -434,14 +467,26 @@ static void mqtt_start(void)
 
 void app_main(void)
 {
+#if CONFIG_SYNC_ROLE_MASTER
+    ESP_ERROR_CHECK(nvs_flash_erase());
+#endif
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "Booting KLSTR fixture");
-
     build_device_id();
     load_fixture_id_from_nvs();
-
+    // Als er nog geen fixture_id is → gebruik device_id
+    if (g_fixture_id[0] == '\0')
+    {
+        strncpy(g_fixture_id, g_device_id, sizeof(g_fixture_id));
+        g_fixture_id[sizeof(g_fixture_id) - 1] = '\0';
+        save_fixture_id_to_nvs(g_fixture_id);
+        ESP_LOGI(TAG, "Auto-set fixture_id = %s", g_fixture_id);
+    }
     wifi_init_sta();
     mqtt_start();
+
+    // Start de UART/MCPWM sync
+    sync_init();
 
     while (1)
     {
