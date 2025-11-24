@@ -15,8 +15,10 @@
 #include "sync.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
-
+#include "ota.h"
+#include "cJSON.h"
 #include "mqtt_client.h"
+#include "sdkconfig.h"
 
 /* ==== WIFI CONFIG ==== */
 
@@ -65,6 +67,16 @@ static void load_fixture_id_from_nvs(void)
 
     if (err == ESP_OK && g_fixture_id[0] != '\0')
     {
+#if !CONFIG_SYNC_ROLE_MASTER
+        // Beschermingslogica: als er per ongeluk "esp-master" in NVS staat
+        // (van een oude master-build), behandel dat als "geen fixture_id".
+        if (strcmp(g_fixture_id, "esp-master") == 0)
+        {
+            ESP_LOGW(TAG, "Ignoring 'esp-master' fixture_id on SLAVE build");
+            g_fixture_id[0] = '\0';
+            return;
+        }
+#endif
         ESP_LOGI(TAG, "Loaded fixture_id from NVS: %s", g_fixture_id);
     }
     else
@@ -172,7 +184,7 @@ static void wifi_init_sta(void)
 
 /* ==== MQTT PUBLISH HELPERS ==== */
 
-static void mqtt_publish_status(const char *status)
+void mqtt_publish_status(const char *status)
 {
     if (!s_mqtt || g_fixture_id[0] == '\0')
         return;
@@ -184,7 +196,7 @@ static void mqtt_publish_status(const char *status)
     ESP_LOGI(TAG, "PUB %s => %s (mid=%d)", topic, status, mid);
 }
 
-static void mqtt_publish_result(const char *json)
+void mqtt_publish_result(const char *json)
 {
     if (!s_mqtt || g_fixture_id[0] == '\0')
         return;
@@ -196,7 +208,7 @@ static void mqtt_publish_result(const char *json)
     ESP_LOGI(TAG, "PUB %s => %s (mid=%d)", topic, json, mid);
 }
 
-static void mqtt_send_announce(void)
+void mqtt_send_announce(void)
 {
     if (!s_mqtt || g_device_id[0] == '\0')
         return;
@@ -249,6 +261,36 @@ static void handle_command(const char *topic, const char *payload, int len)
         vTaskDelay(pdMS_TO_TICKS(500));
         mqtt_publish_result("{\"selftest\":\"ok\"}");
         mqtt_publish_status("idle");
+    }
+    else if (strcmp(cmd, "ota_update") == 0)
+    {
+        const char *url = NULL;
+
+        cJSON *root = cJSON_Parse(payload);
+        if (root)
+        {
+            cJSON *url_item = cJSON_GetObjectItem(root, "url");
+            if (cJSON_IsString(url_item))
+            {
+                url = url_item->valuestring;
+            }
+        }
+
+        if (!url)
+        {
+            ESP_LOGW(TAG, "ota_update: missing url");
+            mqtt_publish_status("update_invalid_payload");
+            if (root)
+                cJSON_Delete(root);
+            return;
+        }
+
+        ESP_LOGI(TAG, "ota_update command with url=%s", url);
+        ota_start_from_url(url);
+
+        if (root)
+            cJSON_Delete(root);
+        return;
     }
     else if (strcmp(cmd, "set_time") == 0)
     {
@@ -467,14 +509,30 @@ static void mqtt_start(void)
 
 void app_main(void)
 {
-#if CONFIG_SYNC_ROLE_MASTER
-    ESP_ERROR_CHECK(nvs_flash_erase());
+    ESP_LOGI(TAG, "Starting OTA firmware version %s, role=%s",
+             CONFIG_APP_VERSION,
+#ifdef CONFIG_SYNC_ROLE_MASTER
+             "MASTER"
+#else
+             "SLAVE"
 #endif
+    );
+
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "Booting KLSTR fixture");
+
     build_device_id();
+
+#if CONFIG_SYNC_ROLE_MASTER
+    // Master: vaste fixture_id = "esp-master"
+    strncpy(g_fixture_id, g_device_id, sizeof(g_fixture_id));
+    g_fixture_id[sizeof(g_fixture_id) - 1] = '\0';
+    ESP_LOGI(TAG, "Using fixed fixture_id (MASTER): %s", g_fixture_id);
+
+#else
     load_fixture_id_from_nvs();
-    // Als er nog geen fixture_id is → gebruik device_id
+
+    // Als er nog geen fixture_id is → gebruik device_id (MAC)
     if (g_fixture_id[0] == '\0')
     {
         strncpy(g_fixture_id, g_device_id, sizeof(g_fixture_id));
@@ -482,10 +540,10 @@ void app_main(void)
         save_fixture_id_to_nvs(g_fixture_id);
         ESP_LOGI(TAG, "Auto-set fixture_id = %s", g_fixture_id);
     }
+#endif
+
     wifi_init_sta();
     mqtt_start();
-
-    // Start de UART/MCPWM sync
     sync_init();
 
     while (1)
