@@ -19,6 +19,8 @@
 #include "cJSON.h"
 #include "mqtt_client.h"
 #include "sdkconfig.h"
+#include "littleFS.h"
+#include "upload_logs.h"
 
 /* ==== WIFI CONFIG ==== */
 
@@ -261,6 +263,38 @@ static void handle_command(const char *topic, const char *payload, int len)
         vTaskDelay(pdMS_TO_TICKS(500));
         mqtt_publish_result("{\"selftest\":\"ok\"}");
         mqtt_publish_status("idle");
+    }
+    else if (strcmp(cmd, "upload_logs") == 0)
+    {
+        const char *server_base_url = NULL;
+
+        cJSON *root = cJSON_Parse(payload);
+        if (root)
+        {
+            cJSON *url_item = cJSON_GetObjectItem(root, "server_base_url");
+            if (cJSON_IsString(url_item))
+            {
+                server_base_url = url_item->valuestring;
+            }
+        }
+
+        if (!server_base_url)
+        {
+            ESP_LOGW(TAG, "upload_logs: missing server_base_url");
+            mqtt_publish_status("upload_logs_invalid_payload");
+            if (root)
+                cJSON_Delete(root);
+            return;
+        }
+
+        ESP_LOGI(TAG, "upload_logs command with server_base_url=%s", server_base_url);
+        mqtt_publish_status("uploading_logs");
+        upload_all_logs(server_base_url, g_device_id);
+        mqtt_publish_status("logs_uploaded");
+
+        if (root)
+            cJSON_Delete(root);
+        return;
     }
     else if (strcmp(cmd, "ota_update") == 0)
     {
@@ -541,7 +575,8 @@ void app_main(void)
         ESP_LOGI(TAG, "Auto-set fixture_id = %s", g_fixture_id);
     }
 #endif
-
+    init_log_fs();
+    create_test_log();
     wifi_init_sta();
     mqtt_start();
     sync_init();

@@ -28,10 +28,13 @@ static const char *TAG = "one_way_sync";
 #define UART_RX_BUF 2048
 #define UART_TX_BUF 2048
 
-#define UART_TX_PIN 9
-#define UART_RX_PIN 10
+// KLSTR.fix V2 pinout (RS485_SYNC channel)
+#define UART_TX_PIN 42     // IO42 -> RS485_SYNC_D  (D)
+#define UART_RX_PIN 40     // IO40 -> RS485_SYNC_R  (R)
+#define RS485_RE_DE_PIN 41 // IO41 -> RS485_SYNC_RE+DE (RE+DE, 0=RX, 1=TX)
 
-#define STROBE_GPIO 6
+// strobe voor tick-mapping
+#define STROBE_GPIO 9 // IO9 (SWCLK header, hier als strobe gebruikt)
 
 static bool is_master = false;
 
@@ -81,7 +84,7 @@ static inline bool hdr_ok(const pkt_hdr_t *h)
 #define HDR_BYTES (sizeof(pkt_hdr_t))
 #define INTERFRAME_GAP_US ((int)((HDR_BYTES * UART_BITS_PER_BYTE * 1000000UL) / UART_BAUD) + 300)
 
-// ========================= UART helpers ========================
+// ========================= UART & RS485 helpers ========================
 
 static void uart_init(void)
 {
@@ -97,6 +100,32 @@ static void uart_init(void)
     ESP_ERROR_CHECK(uart_param_config(UARTX, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UARTX, UART_TX_PIN, UART_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+// RS485 RE+DE (0 = RX-enable, driver uit / 1 = TX-enable, receiver uit)
+static void rs485_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << RS485_RE_DE_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+
+    // start altijd in RX-modus
+    gpio_set_level(RS485_RE_DE_PIN, 0);
+}
+
+static inline void rs485_begin_tx(void)
+{
+    gpio_set_level(RS485_RE_DE_PIN, 1);
+}
+
+static inline void rs485_end_tx(void)
+{
+    gpio_set_level(RS485_RE_DE_PIN, 0);
 }
 
 static esp_err_t uart_send(uart_port_t u,
@@ -424,6 +453,7 @@ static void master_task(void *arg)
     while (1)
     {
         // 1) Marker: stuur SYNC_HDR om t1 op TX te capturen
+        rs485_begin_tx(); // RS485 driver aan (bus zenden)
         arm_tx();
         ESP_ERROR_CHECK(uart_send(UARTX, PKT_SYNC_HDR, seq, NULL, 0));
         uart_wait_tx_done(UARTX, pdMS_TO_TICKS(2));
@@ -437,11 +467,16 @@ static void master_task(void *arg)
         if (!t1)
         {
             ESP_LOGW(TAG, "no t1 edge");
+            rs485_end_tx();
             goto next;
         }
 
         // 2) DATA: stuur SYNC_REQ{t1}
         ESP_ERROR_CHECK(uart_send(UARTX, PKT_SYNC_REQ, seq, &t1, sizeof(t1)));
+        uart_wait_tx_done(UARTX, pdMS_TO_TICKS(2));
+
+        // terug naar RX/idle zodat slaves ook zouden kunnen zenden indien nodig
+        rs485_end_tx();
 
     next:
         seq++;
@@ -457,6 +492,8 @@ static void slave_task(void *arg)
     ESP_LOGI(TAG, "Role: SLAVE. TX=%d RX=%d", UART_TX_PIN, UART_RX_PIN);
 
     uint8_t buf[32];
+
+    // slave blijft permanent in RX-modus (RS485_RE_DE_PIN = 0)
 
     while (1)
     {
@@ -513,9 +550,11 @@ void sync_init(void)
     ESP_LOGI(TAG, "Sync init...");
     capture_init_start();
     uart_init();
+    rs485_init();
     vTaskDelay(pdMS_TO_TICKS(50));
 
 #if CONFIG_SYNC_ROLE_MASTER
+    is_master = true;
     xTaskCreatePinnedToCore(master_task, "sync_master",
                             4096, NULL, 5, NULL, 0);
 #elif CONFIG_SYNC_ROLE_SLAVE
@@ -524,6 +563,7 @@ void sync_init(void)
                             4096, NULL, 5, NULL, 1);
 #else
 #warning "No role set; defaulting to MASTER"
+    is_master = true;
     xTaskCreatePinnedToCore(master_task, "sync_master",
                             4096, NULL, 5, NULL, 0);
 #endif
